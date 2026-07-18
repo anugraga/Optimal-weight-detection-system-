@@ -1,0 +1,254 @@
+import serial
+import serial.tools.list_ports
+import time
+import numpy as np
+import os
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+# ---------------- CONFIGURATION ---------------- #
+BAUD_RATE = 115200
+MEASUREMENT_TIME = 15 # seconds per weight
+SAMPLING_INTERVAL = 0.001 # 1 ms = 1000 Hz
+TREMBLE_THRESHOLD_MULTIPLIER = 5.0 # Tremor threshold
+DATA_FOLDER = "subject_results" # Folder to store data
+# ---------------- UTILITY FUNCTIONS ---------------- #
+def calculate_tremor_sd(ax, ay, az):
+ """Compute standard deviation of tremor magnitude."""
+ if len(ax) == 0:
+ return 0.0
+ mag = np.sqrt(np.array(ax)**2 + np.array(ay)**2 + np.array(az)**2)
+ return np.std(mag)
+def auto_connect_serial():
+ """Automatically connect to first available COM port."""
+ ports = serial.tools.list_ports.comports()
+ if not ports:
+ print(" No COM ports found. Connect STM32/Arduino and retry.")
+ exit()
+ port = ports[0].device
+ print(f" Connected to {port} at {BAUD_RATE} baud\n")
+ ser = serial.Serial(port, BAUD_RATE, timeout=1)
+ time.sleep(2)
+ ser.flushInput()
+ return ser
+# ---------------- BASELINE MEASUREMENT ---------------- #
+def measure_baseline(ser):
+ print(" Measuring baseline tremor and EMG (no load)...")
+ emg_values, ax, ay, az = [], [], [], []
+ samples = [] # store dicts: {'time', 'emg', 'resultant_g'}
+ start_time = time.time()
+ while time.time() - start_time < 5: # 5 seconds
+ line = ser.readline().decode('utf-8', errors='ignore').strip()
+ if not line:
+ continue
+ try:
+ parts = line.split(',')
+ if len(parts) < 5:
+ continue
+ # EMG RMS is sent from Arduino (direct)
+ emg_rms = float(parts[1])
+ emg_values.append(emg_rms)
+ ax_val, ay_val, az_val = float(parts[2]), float(parts[3]), float(parts[4])
+ ax.append(ax_val)
+ ay.append(ay_val)
+ az.append(az_val)
+ # resultant acceleration in g (assuming ax/ay/az are in g already)
+ resultant = np.sqrt(ax_val**2 + ay_val**2 + az_val**2)
+ t = time.time() - start_time
+ samples.append({'time': t, 'emg': emg_rms, 'resultant_g': resultant})
+ except ValueError:
+ continue
+ time.sleep(SAMPLING_INTERVAL)
+ if len(emg_values) == 0 or len(ax) == 0:
+ print(" No valid baseline data detected. Please check connections.\n")
+ return None, None, None
+ baseline_rms = np.mean(emg_values) # Use direct RMS (no recalculation)
+ baseline_tremor = calculate_tremor_sd(ax, ay, az)
+ print(f" Baseline EMG RMS: {baseline_rms:.2f}")
+ print(f" Baseline Tremor SD: {baseline_tremor:.4f} g\n")
+ return baseline_rms, baseline_tremor, samples
+# ---------------- LIFT TRIAL ---------------- #
+def run_lift_trial(ser, weight, duration, baseline_tremor_sd):
+ emg_values, ax, ay, az = [], [], [], []
+ samples = [] # store (time, emg_rms, resultant_acc_g)
+ print(f" Lift {weight} kg for up to {duration} seconds...")
+ start_time = time.time()
+ excessive_tremor = False
+ tremor_sd = 0.0
+ while time.time() - start_time < duration:
+ line = ser.readline().decode('utf-8', errors='ignore').strip()
+ if not line:
+ continue
+ try:
+ parts = line.split(',')
+ if len(parts) < 5:
+ continue
+ # ---------- Use Arduino EMG RMS directly ----------
+ emg_rms = float(parts[1])
+ emg_values.append(emg_rms)
+ ax_val, ay_val, az_val = float(parts[2]), float(parts[3]), float(parts[4])
+ ax.append(ax_val)
+ ay.append(ay_val)
+ az.append(az_val)
+ resultant = np.sqrt(ax_val**2 + ay_val**2 + az_val**2) # in g
+ t = time.time() - start_time
+ samples.append({'time': t, 'emg': emg_rms, 'resultant_g': resultant})
+ except ValueError:
+ continue
+ # Tremor detection using SD of resultant acceleration so far
+ tremor_sd = calculate_tremor_sd(ax, ay, az)
+ if tremor_sd > baseline_tremor_sd * TREMBLE_THRESHOLD_MULTIPLIER:
+ print(f" Excessive tremor detected at {weight} kg → stopping trial early.")
+ excessive_tremor = True
+ break
+ time.sleep(SAMPLING_INTERVAL)
+ # handle case where no emg_values collected (shouldn't happen, but safe)
+ rms = np.mean(emg_values) if len(emg_values) > 0 else 0.0
+ print(f" EMG RMS for {weight} kg: {rms:.2f}")
+ print(f" Tremor for {weight} kg: {tremor_sd:.4f} g\n")
+ return rms, excessive_tremor, samples, tremor_sd
+# ---------------- SAVE RESULTS ---------------- #
+def save_results(subject_name, baseline_samples, tested_weights, optimal_weight):
+ """
+ Create an Excel workbook with:
+ - Baseline sheet
+ - One sheet per weight (e.g., "1.0 kg")
+ - Summary sheet with Table 1 (averages) and Table 2 (peaks) separated by blank rows
+ """
+ os.makedirs(DATA_FOLDER, exist_ok=True)
+ filename = os.path.join(DATA_FOLDER, f"{subject_name}_results.xlsx")
+ wb = Workbook()
+ # remove default sheet
+ default = wb.active
+ wb.remove(default)
+ # --- Baseline sheet ---
+ ws_base = wb.create_sheet(title="Baseline")
+ ws_base.append(["Time (s)", "EMG RMS", "Resultant Acceleration (g)"])
+ for s in baseline_samples:
+ ws_base.append([round(s['time'], 4), s['emg'], s['resultant_g']])
+ # --- Sheets per weight ---
+ for wt in tested_weights:
+ sheet_name = f"{wt['weight']} kg"
+ # Excel sheet names must be <=31 chars
+ if len(sheet_name) > 31:
+ sheet_name = sheet_name[:31]
+ ws = wb.create_sheet(title=sheet_name)
+ ws.append(["Time (s)", "EMG RMS", "Resultant Acceleration (g)"])
+ for s in wt['samples']:
+ ws.append([round(s['time'], 4), s['emg'], s['resultant_g']])
+ # --- Summary sheet ---
+ ws_sum = wb.create_sheet(title="Summary")
+ # Table 1 header
+ ws_sum.append(["Weight (kg)", "Avg EMG RMS (15s)", "Avg Resultant Acc (g)"])
+ # Baseline averages row
+ if baseline_samples and len(baseline_samples) > 0:
+ base_avg_emg = np.mean([s['emg'] for s in baseline_samples])
+ base_avg_res = np.mean([s['resultant_g'] for s in baseline_samples])
+ else:
+ base_avg_emg = None
+ base_avg_res = None
+ ws_sum.append(["Baseline", round(base_avg_emg, 4) if base_avg_emg is not None else 
+"", round(base_avg_res, 6) if base_avg_res is not None else ""])
+ # fill for each tested weight
+ for wt in tested_weights:
+ emg_avg = wt['emg_rms']
+ if wt['samples'] and len(wt['samples']) > 0:
+ res_avg = np.mean([s['resultant_g'] for s in wt['samples']])
+ else:
+ res_avg = ""
+ ws_sum.append([wt['weight'], round(emg_avg, 4), round(res_avg, 6) if res_avg != "" else 
+""])
+ # blank row
+ ws_sum.append([])
+ # Optimal load line
+ ws_sum.append(["Optimal Load", f"{optimal_weight} kg"])
+ # blank row
+ ws_sum.append([])
+ # Table 2 header (peak EMG info)
+ ws_sum.append(["Weight (kg)", "Max EMG RMS (instant)", "Time at Max EMG (s)", 
+"Resultant Acc at that time (g)"])
+ # Baseline peak row
+ if baseline_samples and len(baseline_samples) > 0:
+ base_max_emg = max(baseline_samples, key=lambda x: x['emg'])['emg']
+ base_idx = max(range(len(baseline_samples)), key=lambda i: 
+baseline_samples[i]['emg'])
+ base_time = baseline_samples[base_idx]['time']
+ base_res_at_max = baseline_samples[base_idx]['resultant_g']
+ ws_sum.append(["Baseline", round(base_max_emg,4), round(base_time,4), 
+round(base_res_at_max,6)])
+ else:
+ ws_sum.append(["Baseline", "", "", ""])
+ # Peaks for each tested weight
+ for wt in tested_weights:
+ if wt['samples'] and len(wt['samples']) > 0:
+ peak_sample = max(wt['samples'], key=lambda x: x['emg'])
+ ws_sum.append([wt['weight'], round(peak_sample['emg'], 4), 
+round(peak_sample['time'], 4), round(peak_sample['resultant_g'], 6)])
+ else:
+ ws_sum.append([wt['weight'], "", "", ""])
+ # Optional: auto-adjust column widths for readability
+ for sheet in wb.worksheets:
+ for col in sheet.columns:
+ max_length = 0
+ col_letter = get_column_letter(col[0].column)
+ for cell in col:
+ try:
+ if cell.value is None:
+ length = 0
+ else:
+ length = len(str(cell.value))
+ if length > max_length:
+ max_length = length
+ except:
+ pass
+ adjusted_width = (max_length + 2)
+ sheet.column_dimensions[col_letter].width = adjusted_width
+ wb.save(filename)
+ print(f" Excel results saved to '{filename}'\n")
+# ---------------- MAIN ---------------- #
+def main():
+ subject_name = input(" Enter subject name: ").strip().replace(" ", "_")
+ ser = auto_connect_serial()
+ baseline_rms, baseline_tremor_sd, baseline_samples = measure_baseline(ser)
+ if baseline_rms is None:
+ print(" Baseline measurement failed. Please reconnect sensors and rerun.")
+ ser.close()
+ return
+ previous_rms = baseline_rms
+ optimal_weight = 0
+ tested_weights = []
+ print(" Start incremental weight testing. Enter 'done' when finished.\n")
+ while True:
+ user_input = input("Enter next weight (kg) or 'done': ").strip()
+ if user_input.lower() == "done":
+ break
+ try:
+ weight = float(user_input)
+ if weight <= 0:
+ print(" Enter a positive weight.\n")
+ continue
+ except ValueError:
+ print(" Invalid input. Try again.\n")
+ continue
+ rms, tremor_flag, samples, tremor_sd = run_lift_trial(ser, weight, MEASUREMENT_TIME, 
+baseline_tremor_sd)
+ tested_weights.append({'weight': weight, 'emg_rms': rms, 'samples': samples, 
+'tremor_sd': tremor_sd})
+ if tremor_flag:
+ print(f" Optimal weight (tremor threshold reached): {optimal_weight} kg\n")
+ break
+ if rms < previous_rms:
+ print(f" EMG decreased at {weight} kg → Optimal weight: {optimal_weight} kg\n")
+ break
+ else:
+ previous_rms = rms
+ optimal_weight = weight
+ print("\n--- ALL TESTED WEIGHTS ---")
+ print(f"{'Weight (kg)':<12} {'EMG RMS':<12} {'Tremor':<12}")
+ for t in tested_weights:
+ tremor_sd = np.std([s['resultant_g'] for s in t['samples']]) if t['samples'] else 0.0
+ print(f"{t['weight']:<12.1f} {t['emg_rms']:<12.2f} {tremor_sd:<12.4f}")
+ print(f"\n FINAL OPTIMAL WEIGHT for {subject_name}: {optimal_weight} kg\n")
+ save_results(subject_name, baseline_samples, tested_weights, optimal_weight)
+ ser.close()
+if __name__ == "__main__":
+ main()
